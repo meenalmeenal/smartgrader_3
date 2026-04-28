@@ -5,7 +5,26 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from PIL import Image
 import io
+import re as _re
 from similarity import keyword_report, answer_level_sim, format_sim_context
+
+# ── MCQ helpers ───────────────────────────────────────────────────────────────
+_MCQ_OPTIONS = {"a","b","c","d","e","1","2","3","4","5"}
+
+def is_mcq_answer(ans: str) -> bool:
+    """True if student wrote just an option letter/number (MCQ-style)."""
+    clean = ans.strip().lower().strip("().:) ")
+    # Single letter/digit, or 'option b', 'choice a', etc.
+    if clean in _MCQ_OPTIONS:
+        return True
+    m = _re.match(r'^(?:option|choice|ans(?:wer)?)\s*([a-e1-5])$', clean)
+    return bool(m)
+
+def extract_option(text: str) -> str:
+    """Pull the option letter from text like 'B', '(b)', 'Option B: ...' """
+    text = text.strip()[:20]  # only look at start of text
+    m = _re.search(r'\b([a-eA-E1-5])\b', text)
+    return m.group(1).lower() if m else text.strip().lower()[:1]
 
 load_dotenv()
 app = FastAPI(title="SmartGrader API")
@@ -217,7 +236,34 @@ async def grade(
                     "keywords_partial":[],"feedback":"No answer written.","needs_review":True})
                 continue
 
-            # ── Deterministic marks via hybrid similarity ──────────────────
+            # ── MCQ: exact letter match, skip similarity ───────────────────
+            if is_mcq_answer(ans):
+                student_opt = extract_option(ans)
+                correct_opt = extract_option(ca)
+                is_correct  = student_opt == correct_opt
+                marks_awarded = mks if is_correct else 0
+                verdict = "Correct" if is_correct else "Incorrect"
+                graded.append({
+                    "display_label":     lbl,
+                    "parent":            u["parent"],
+                    "student_answer":    ans,
+                    "correct_answer":    ca,
+                    "key_concepts":      kc,
+                    "marks_awarded":     marks_awarded,
+                    "marks_available":   mks,
+                    "confidence":        95,
+                    "confidence_reason": "MCQ — exact option match.",
+                    "keywords_present":  [ca] if is_correct else [],
+                    "keywords_missing":  [] if is_correct else [ca],
+                    "keywords_partial":  [],
+                    "feedback":          f"{'Correct option selected.' if is_correct else f'Incorrect. The correct option was {correct_opt.upper()}.'}",
+                    "needs_review":      False,
+                    "answer_type":       "mcq",
+                    "similarity_scores": {"answer_sim": 1.0 if is_correct else 0.0, "multiplier": 1.0 if is_correct else 0.0},
+                })
+                continue
+
+            # ── Text answer: deterministic marks via hybrid similarity ─────
             report      = keyword_report(ans, kc,
                               threshold_present=thresh["present"],
                               threshold_partial=thresh["partial"])
@@ -262,6 +308,7 @@ async def grade(
                 "keywords_partial":  report["partial"],
                 "feedback":          fb.get("feedback", ""),
                 "needs_review":      fb.get("needs_review", confidence < 55),
+                "answer_type":       "text",
                 "similarity_scores": {
                     "answer_sim": ans_sim,
                     "multiplier": report["partial_mark_multiplier"],
