@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from PIL import Image
 import io
+from similarity import keyword_report, answer_level_sim, format_sim_context
 
 load_dotenv()
 app = FastAPI(title="SmartGrader API")
@@ -192,29 +193,80 @@ async def grade(
         print(f"DEBUG key_raw: {key_raw[:300]}")
         key_map = {i["label"]: i for i in clean_json(key_raw)}
 
-        sg = {"strict":"Be strict — require most key concepts explicitly.",
-              "moderate":"Be fair — award marks for clear understanding.",
-              "lenient":"Be lenient — give benefit of doubt."}
+        # Strictness → similarity thresholds
+        STRICT_THRESHOLDS = {
+            "strict":   {"present": 0.80, "partial": 0.60},
+            "moderate": {"present": 0.70, "partial": 0.45},
+            "lenient":  {"present": 0.60, "partial": 0.35},
+        }
+        thresh = STRICT_THRESHOLDS.get(strictness, STRICT_THRESHOLDS["moderate"])
 
         graded = []
         for u in flat:
-            lbl    = u["display_label"]
-            ans    = answer_map.get(lbl, "").strip()
-            ki     = key_map.get(lbl, {})
-            ca     = ki.get("correct_answer","")
-            kc     = ki.get("key_concepts",[])
-            mks    = u["marks"]
+            lbl = u["display_label"]
+            ans = answer_map.get(lbl, "").strip()
+            ki  = key_map.get(lbl, {})
+            ca  = ki.get("correct_answer", "")
+            kc  = ki.get("key_concepts", [])
+            mks = u["marks"]
 
             if not ans:
                 graded.append({"display_label":lbl,"parent":u["parent"],"student_answer":"","correct_answer":ca,
                     "key_concepts":kc,"marks_awarded":0,"marks_available":mks,"confidence":95,
                     "confidence_reason":"Answer is blank.","keywords_present":[],"keywords_missing":kc,
-                    "feedback":"No answer written.","needs_review":True})
+                    "keywords_partial":[],"feedback":"No answer written.","needs_review":True})
                 continue
 
-            gr = await groq(f"You are a {subject} teacher. Return ONLY valid JSON.",
-                f"Grade this as a {subject} teacher.\nPART: {lbl}\nMARKS: {mks}\nSTRICTNESS: {sg.get(strictness)}\nCORRECT: {ca}\nKEY CONCEPTS: {', '.join(kc)}\nSTUDENT: {ans}\n\nReturn JSON: {{\"marks_awarded\":<0-{mks}>,\"marks_available\":{mks},\"confidence\":<0-100>,\"confidence_reason\":\"...\",\"keywords_present\":[],\"keywords_missing\":[],\"feedback\":\"2 sentence comment\",\"needs_review\":<true if conf<55>}}", 0.2)
-            graded.append({"display_label":lbl,"parent":u["parent"],"student_answer":ans,"correct_answer":ca,"key_concepts":kc,**clean_json(gr)})
+            # ── Deterministic marks via hybrid similarity ──────────────────
+            report      = keyword_report(ans, kc,
+                              threshold_present=thresh["present"],
+                              threshold_partial=thresh["partial"])
+            ans_sim     = answer_level_sim(ans, ca)
+            sim_context = format_sim_context(report, ans_sim)
+
+            # Marks locked — pure math, no LLM
+            marks_awarded = max(0, min(mks, round(report["partial_mark_multiplier"] * mks)))
+
+            # Confidence derived from average hybrid score across concepts
+            if report["per_keyword"]:
+                avg_hybrid = sum(r["hybrid"] for r in report["per_keyword"]) / len(report["per_keyword"])
+            else:
+                avg_hybrid = ans_sim
+            confidence = round(min(95, max(40, avg_hybrid * 100)))
+
+            # ── LLM only writes feedback text — no mark decisions ──────────
+            fb_raw = await groq(
+                f"You are a {subject} teacher. Return ONLY valid JSON.",
+                f"Write brief feedback for this graded answer.\n"
+                f"PART: {lbl}\nMARKS AWARDED: {marks_awarded}/{mks}\n"
+                f"STUDENT: {ans}\nCORRECT: {ca}\n\n"
+                f"{sim_context}\n\n"
+                f"Return ONLY: {{\"feedback\":\"2 sentence constructive comment\","
+                f"\"confidence_reason\":\"one sentence explaining AI confidence level\","
+                f"\"needs_review\":{str(confidence < 55).lower()}}}",
+                0.3)
+            fb = clean_json(fb_raw)
+
+            graded.append({
+                "display_label":     lbl,
+                "parent":            u["parent"],
+                "student_answer":    ans,
+                "correct_answer":    ca,
+                "key_concepts":      kc,
+                "marks_awarded":     marks_awarded,
+                "marks_available":   mks,
+                "confidence":        confidence,
+                "confidence_reason": fb.get("confidence_reason", ""),
+                "keywords_present":  report["present"],
+                "keywords_missing":  report["missing"],
+                "keywords_partial":  report["partial"],
+                "feedback":          fb.get("feedback", ""),
+                "needs_review":      fb.get("needs_review", confidence < 55),
+                "similarity_scores": {
+                    "answer_sim": ans_sim,
+                    "multiplier": report["partial_mark_multiplier"],
+                }
+            })
 
         total_obt = sum(g["marks_awarded"] for g in graded)
         pct       = round(total_obt/total_max*100) if total_max else 0
