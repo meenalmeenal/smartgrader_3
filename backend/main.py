@@ -411,6 +411,7 @@ async def grade(
             sim_marks = report["blended_multiplier"] * mks
 
             # Confidence — RAG grounding primary signal
+            avg_keyword = 0.0  # default if no keywords
             if report["per_keyword"]:
                 avg_keyword = sum(r["hybrid"] for r in report["per_keyword"]) / len(report["per_keyword"])
                 rag_confidence = (ans_sim * 0.60) + (avg_keyword * 0.40)
@@ -438,7 +439,7 @@ async def grade(
                 f"- keyword missing + not_understood → say review concept X\n\n"
                 f"Return ONLY: {{\"feedback\":\"2 sentence constructive comment\","
                 f"\"confidence_reason\":\"one sentence\","
-                f"\"suggested_marks\":{round(sim_marks)},"
+                f"\"suggested_marks\":0,"
                 f"\"needs_review\":{str(rag_confidence < 0.55).lower()}}}",
                 0.3)
 
