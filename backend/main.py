@@ -407,7 +407,8 @@ async def grade(
             sim_context = format_sim_context(report, ans_sim)
 
             # Marks — keyword presence + conceptual understanding
-            marks_awarded = max(0, min(mks, round(report["blended_multiplier"] * mks)))
+            # Similarity-based marks
+            sim_marks = report["blended_multiplier"] * mks
 
             # Confidence — RAG grounding primary signal
             if report["per_keyword"]:
@@ -415,33 +416,54 @@ async def grade(
                 rag_confidence = (ans_sim * 0.60) + (avg_keyword * 0.40)
             else:
                 rag_confidence = ans_sim
-            confidence = round(min(95, max(40, rag_confidence * 100)))
 
-            # ── LLM only writes feedback text — no mark decisions ──────────
+            # ── LLM grades + writes feedback ──────────────────────────────
             fb_raw = await groq(
                 f"You are a {subject} teacher. Return ONLY valid JSON. Never use double quotes inside string values - use single quotes or rephrase instead.",
-                f"Write brief feedback for this graded answer.\n"
-                f"PART: {lbl}\nMARKS AWARDED: {marks_awarded}/{mks}\n"
-                f"STUDENT: {ans}\nCORRECT: {ca}\n\n"
-                f"{sim_context}\n\n"
-                f"UNDERSTANDING ANALYSIS:\n"
-                + "\n".join([
-                    f"- '{e['keyword']}': "
-                    f"{'jargon used ✓' if e['status'] == 'present' else 'jargon missing ✗'}, "
-                    f"understanding: {e.get('understanding', 'n/a')} "
-                    f"(score: {e.get('understanding_score', 0)})"
-                    for e in report["per_keyword"]
-                ]) +
-                f"\n\nFEEDBACK RULES:\n"
-                f"- keyword present → acknowledge correct terminology\n"
-                f"- keyword missing + understood → say 'you demonstrated understanding but use the term X'\n"
-                f"- keyword missing + not_understood → say 'review concept X'\n"
-                f"- keyword missing + partial → say 'you touched on X but need more precision'\n\n"
+                f"Grade this answer and write feedback.\n"
+                f"PART: {lbl} | MAX MARKS: {mks}\n"
+                f"STUDENT: {ans[:300]}\n"
+                f"CORRECT: {ca[:300]}\n\n"
+                f"SIMILARITY ANALYSIS (already computed):\n"
+                f"- Overall answer similarity to model: {ans_sim}\n"
+                f"- Keywords present: {report['present']}\n"
+                f"- Keywords missing but understood: {[e['keyword'] for e in report['per_keyword'] if e.get('understanding')=='understood' and e['status']!='present']}\n"
+                f"- Keywords not understood: {[e['keyword'] for e in report['per_keyword'] if e.get('understanding')=='not_understood']}\n\n"
+                f"GRADING RULES:\n"
+                f"- Award marks for correct understanding even if exact jargon missing\n"
+                f"- Deduct marks only if concept is genuinely wrong or missing\n"
+                f"- suggested_marks must be integer between 0 and {mks}\n\n"
+                f"FEEDBACK RULES:\n"
+                f"- keyword missing + understood → say you demonstrated understanding but use the term X\n"
+                f"- keyword missing + not_understood → say review concept X\n\n"
                 f"Return ONLY: {{\"feedback\":\"2 sentence constructive comment\","
-                f"\"confidence_reason\":\"one sentence explaining AI confidence level\","
+                f"\"confidence_reason\":\"one sentence\","
+                f"\"suggested_marks\":{round(sim_marks)},"
                 f"\"needs_review\":{str(rag_confidence < 0.55).lower()}}}",
                 0.3)
-            fb = clean_json(fb_raw)
+
+            import re as _re2
+            fb_raw_fixed = _re2.sub(
+                r'("feedback"\s*:\s*")(.*?)("(?:\s*,|\s*}))',
+                lambda m: m.group(1) + m.group(2).replace('"', "'") + m.group(3),
+                fb_raw, flags=_re2.DOTALL)
+            fb_raw_fixed = _re2.sub(
+                r'("confidence_reason"\s*:\s*")(.*?)("(?:\s*,|\s*}))',
+                lambda m: m.group(1) + m.group(2).replace('"', "'") + m.group(3),
+                fb_raw_fixed, flags=_re2.DOTALL)
+            fb = clean_json(fb_raw_fixed)
+
+            # Blend similarity + LLM marks
+            llm_marks = float(fb.get("suggested_marks", sim_marks))
+            llm_marks = max(0, min(mks, llm_marks))
+            marks_awarded = max(0, min(mks, round((sim_marks * 0.50) + (llm_marks * 0.50))))
+
+            # Confidence — agreement between sim and LLM boosts confidence
+            sim_pct   = sim_marks / mks if mks else 0
+            llm_pct   = llm_marks / mks if mks else 0
+            agreement = 1.0 - abs(sim_pct - llm_pct)
+            rag_confidence = (ans_sim * 0.50) + (avg_keyword * 0.30) + (agreement * 0.20)
+            confidence = round(min(95, max(40, rag_confidence * 100)))
 
 
             graded.append({

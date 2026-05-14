@@ -218,6 +218,14 @@ def _best_sentence_score(sentences: list[str], concept: str) -> tuple[float, flo
     if not sentences:
         return 0.0, 0.0, 0.0, 0.0, ""
 
+    # ── Exact match shortcut for short keywords ──
+    concept_clean = concept.strip().lower()
+    if len(concept_clean.split()) <= 2:
+        for sent in sentences:
+            if concept_clean in sent.lower():
+                return 0.85, 0.85, 0.85, 0.85, sent
+    # ────────────────────────────────────────────
+
     best_hybrid  = -1.0
     best_bm25    = 0.0
     best_fuzzy   = 0.0
