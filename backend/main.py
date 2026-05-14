@@ -212,16 +212,23 @@ async def ocr(file_bytes, mime_type):
         {"text":"Extract ALL text from this answer sheet exactly as written. Preserve question numbers (Q1, Q1a, Q1b, Q2 etc.), section headings, and full answers word for word. If unclear write [unclear]. Return only extracted text."}
     ]}]}
     for attempt in range(3):
-        async with httpx.AsyncClient(timeout=120) as c:
-            r = await c.post(GEMINI_URL, json=payload)
-            if r.status_code == 429:
-                wait = 15 * (attempt + 1)
-                print(f"Gemini 429 — waiting {wait}s before retry {attempt+1}/3")
-                await asyncio.sleep(wait)
+        try:
+            async with httpx.AsyncClient(timeout=120) as c:
+                r = await c.post(GEMINI_URL, json=payload)
+                if r.status_code == 429:
+                    wait = 15 * (attempt + 1)
+                    print(f"Gemini 429 — waiting {wait}s before retry {attempt+1}/3")
+                    await asyncio.sleep(wait)
+                    continue
+                r.raise_for_status()
+                return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception as e:
+            if attempt < 2:
+                print(f"Gemini OCR attempt {attempt+1} failed: {e}. Retrying...")
+                await asyncio.sleep(10)
                 continue
-            r.raise_for_status()
-            return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-    raise Exception("Gemini rate limit hit after 3 retries. Wait a minute and try again.")
+            raise Exception(f"OCR failed after 3 attempts: {str(e)}")
+    raise Exception("Gemini OCR failed after 3 retries.")
 
 
 async def ocr_answer_key(file_bytes, mime_type):
@@ -393,7 +400,6 @@ async def grade(
                 continue
 
             # ── Text answer: deterministic marks via hybrid similarity ─────
-            # ── Text answer: deterministic marks via hybrid similarity ─────
             report      = concept_understanding_report(ans, ca, kc,
                               threshold_present=thresh["present"],
                               threshold_partial=thresh["partial"])
@@ -456,7 +462,7 @@ async def grade(
                 "answer_type":       "text",
                 "similarity_scores": {
                     "answer_sim": ans_sim,
-                    "multiplier": report["partial_mark_multiplier"],
+                    "multiplier": report["blended_multiplier"],
                 }
             })
 
