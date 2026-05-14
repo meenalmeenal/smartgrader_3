@@ -331,17 +331,28 @@ def keyword_report(
 
 def answer_level_sim(student_answer: str, correct_answer: str) -> float:
     """
-    Overall hybrid similarity between full student answer and full model answer.
-    Uses sentence-level — takes best matching sentence from student vs full correct answer.
+    RAG-style: chunk model answer into sentences (each = a 'document chunk').
+    For each student sentence, find best matching model chunk.
+    Average across all student sentences = overall grounding score.
     """
-    # Normalize symbols before scoring
     student_answer = _normalize_symbols(student_answer)
     correct_answer = _normalize_symbols(correct_answer)
-    sentences = _split_sentences(student_answer)
-    if not sentences:
+    
+    student_sents = _split_sentences(student_answer)
+    model_chunks  = _split_sentences(correct_answer)
+    
+    if not student_sents or not model_chunks:
         return 0.0
-    best = max(_hybrid(s, correct_answer)[0] for s in sentences)
-    return round(best, 4)
+    
+    # For each student sentence, find best matching model answer chunk
+    sentence_scores = []
+    for s_sent in student_sents:
+        best_chunk_score = max(_hybrid(s_sent, chunk)[0] for chunk in model_chunks)
+        sentence_scores.append(best_chunk_score)
+    
+    # Average = how well the student answer is grounded in model answer chunks
+    avg = sum(sentence_scores) / len(sentence_scores)
+    return round(max(0.0, min(1.0, avg)), 4)
 
 
 def format_sim_context(report: dict, answer_sim: float) -> str:
@@ -390,3 +401,97 @@ def format_sim_context(report: dict, answer_sim: float) -> str:
     ]
 
     return "\n".join(lines)
+
+def concept_understanding_report(
+    student_answer: str,
+    correct_answer: str,
+    key_concepts: list[str],
+    threshold_present: float = THRESHOLD_PRESENT,
+    threshold_partial: float = THRESHOLD_PARTIAL,
+) -> dict:
+    """
+    Combines keyword check + sentence-level understanding check.
+    
+    For each missing/partial keyword, checks if student demonstrated
+    understanding via sentence similarity against the model chunk
+    that contains that keyword.
+    """
+    student_answer = _normalize_symbols(student_answer)
+    correct_answer = _normalize_symbols(correct_answer)
+    
+    model_chunks  = _split_sentences(correct_answer)
+    student_sents = _split_sentences(student_answer)
+    
+    # First run normal keyword report
+    kw_report = keyword_report(student_answer, key_concepts,
+                               threshold_present, threshold_partial)
+    
+    # For each missing/partial keyword, find which model chunk contains it
+    # then check if any student sentence understands that chunk
+    enhanced = []
+    for r in kw_report["per_keyword"]:
+        entry = dict(r)  # copy
+        
+        if r["status"] in ("missing", "partial"):
+            kw = r["keyword"].lower()
+            
+            # Find model chunk that contains this keyword
+            relevant_chunk = None
+            for chunk in model_chunks:
+                if kw in chunk.lower():
+                    relevant_chunk = chunk
+                    break
+            
+            if relevant_chunk and student_sents:
+                # Check if student understood the concept behind this keyword
+                understanding_score = max(
+                    _hybrid(s, relevant_chunk)[0] for s in student_sents
+                )
+                entry["understanding_score"] = round(understanding_score, 4)
+                
+                # Classify
+                if understanding_score >= 0.70:
+                    entry["understanding"] = "understood"   # got it, wrong words
+                elif understanding_score >= 0.45:
+                    entry["understanding"] = "partial"      # vague grasp
+                else:
+                    entry["understanding"] = "not_understood"  # genuinely missing
+            else:
+                entry["understanding_score"] = 0.0
+                entry["understanding"] = "not_understood"
+        else:
+            # keyword present → understanding assumed
+            entry["understanding_score"] = 1.0
+            entry["understanding"] = "understood"
+        
+        enhanced.append(entry)
+    
+    # Recalculate multiplier using understanding
+    total = len(enhanced)
+    if total == 0:
+        return {**kw_report, "per_keyword": enhanced, "blended_multiplier": 1.0}
+    
+    score = 0.0
+    for e in enhanced:
+        if e["status"] == "present":
+            score += 1.0                          # jargon + understanding
+        elif e["status"] == "partial":
+            if e["understanding"] == "understood":
+                score += 0.85                     # almost full — right idea, weak jargon
+            else:
+                score += 0.5                      # partial jargon, partial understanding
+        else:  # missing keyword
+            if e["understanding"] == "understood":
+                score += 0.65                     # understood but no jargon
+            elif e["understanding"] == "partial":
+                score += 0.30                     # vague
+            else:
+                score += 0.0                      # genuinely missing
+    
+    blended_multiplier = round(score / total, 4)
+    
+    return {
+        **kw_report,
+        "per_keyword": enhanced,
+        "blended_multiplier": blended_multiplier
+    }

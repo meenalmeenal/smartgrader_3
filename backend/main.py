@@ -6,7 +6,12 @@ from dotenv import load_dotenv
 from PIL import Image
 import io
 import re as _re
-from similarity import keyword_report, answer_level_sim, format_sim_context
+from similarity import keyword_report, answer_level_sim, format_sim_context, concept_understanding_report
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+
+
 
 # ── MCQ helpers ───────────────────────────────────────────────────────────────
 _MCQ_OPTIONS = {"a","b","c","d","e","1","2","3","4","5"}
@@ -26,7 +31,7 @@ def extract_option(text: str) -> str:
     m = _re.search(r'\b([a-eA-E1-5])\b', text)
     return m.group(1).lower() if m else text.strip().lower()[:1]
 
-load_dotenv()
+
 app = FastAPI(title="SmartGrader API")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:3000"], allow_methods=["*"], allow_headers=["*"])
 
@@ -90,60 +95,166 @@ async def groq(system, user, temp=0.1):
                 await asyncio.sleep(5)
                 continue
             raise Exception(f"Groq failed after 3 attempts: {str(e)}")
-# async def ocr(file_bytes, mime_type):
-#     import asyncio
-#     payload = {"contents":[{"parts":[
-#         {"inline_data":{"mime_type":mime_type,"data":to_b64(file_bytes)}},
-#         {"text":"Extract ALL text from this answer sheet exactly as written. Preserve question numbers (Q1, Q1a, Q1b, Q2 etc.), section headings, and full answers word for word. If unclear write [unclear]. Return only extracted text."}
-#     ]}]}
-#     for attempt in range(3):
-#         async with httpx.AsyncClient(timeout=120) as c:
-#             r = await c.post(GEMINI_URL, json=payload)
-#             if r.status_code == 429:
-#                 wait = 15 * (attempt + 1)
-#                 print(f"Gemini 429 — waiting {wait}s before retry {attempt+1}/3")
-#                 await asyncio.sleep(wait)
-#                 continue
-#             r.raise_for_status()
-#             return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-#     raise Exception("Gemini rate limit hit after 3 retries. Wait a minute and try again.")
+
+
 
 def pdf_to_image_bytes(file_bytes):
+    """Render ALL pages of a PDF and stitch them vertically into one PNG."""
     import fitz
-    pdf = fitz.open(stream=file_bytes, filetype="pdf")
-    page = pdf.load_page(0)
-    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-    img_bytes = pix.tobytes("png")
+    from PIL import Image as PILImage
+    import io as _io
+
+    pdf    = fitz.open(stream=file_bytes, filetype="pdf")
+    matrix = fitz.Matrix(2, 2)   # 2× resolution for clarity
+
+    page_images = []
+    for i in range(len(pdf)):
+        pix  = pdf.load_page(i).get_pixmap(matrix=matrix)
+        img  = PILImage.open(_io.BytesIO(pix.tobytes("png")))
+        page_images.append(img)
     pdf.close()
-    return img_bytes, "image/png"
+
+    if not page_images:
+        raise Exception("PDF has no pages")
+
+    # Stitch vertically: width = widest page, height = sum of all page heights
+    total_w = max(img.width  for img in page_images)
+    total_h = sum(img.height for img in page_images)
+    canvas  = PILImage.new("RGB", (total_w, total_h), (255, 255, 255))
+    y_offset = 0
+    for img in page_images:
+        canvas.paste(img, (0, y_offset))
+        y_offset += img.height
+
+    buf = _io.BytesIO()
+    canvas.save(buf, format="PNG")
+    return buf.getvalue(), "image/png"
+
+######### GROQ OCR commented out for less use of GROQ tokens ###########
+
+
+# async def ocr(file_bytes, mime_type):
+#     import asyncio
+#     b64 = to_b64(file_bytes)
+    
+#     for attempt in range(3):
+#         try:
+#             async with httpx.AsyncClient(timeout=120) as c:
+#                 r = await c.post(GROQ_URL,
+#                     headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+#                     json={
+#                         "model": OCR_MODEL,
+#                         "max_tokens": 4000,
+#                         "messages": [{
+#                             "role": "user",
+#                             "content": [
+#                                 {"type": "text", "text": "Extract ALL text from this answer sheet exactly as written. Preserve question numbers (Q1, Q1a, Q1b, Q2 etc.), section headings, and full answers word for word. If unclear write [unclear]. Return only extracted text."},
+#                                 {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}}
+#                             ]
+#                         }]
+#                     })
+#                 r.raise_for_status()
+#                 return r.json()["choices"][0]["message"]["content"]
+#         except Exception as e:
+#             if attempt < 2:
+#                 await asyncio.sleep(10)
+#                 continue
+#             raise Exception(f"OCR failed after 3 attempts: {str(e)}")
+
+#################################################################
+
+# async def ocr_answer_key(file_bytes, mime_type):
+#     """Specialized OCR for answer keys — focuses on identifying correct MCQ options."""
+#     import asyncio
+#     b64 = to_b64(file_bytes)
+
+#     for attempt in range(3):
+#         try:
+#             async with httpx.AsyncClient(timeout=120) as c:
+#                 r = await c.post(GROQ_URL,
+#                     headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+#                     json={
+#                         "model": OCR_MODEL,
+#                         "max_tokens": 4000,
+#                         "messages": [{
+#                             "role": "user",
+#                             "content": [
+#                                 {"type": "text", "text": (
+#                                     "This is an ANSWER KEY document. Extract all text exactly as written.\n"
+#                                     "CRITICAL for MCQ questions:\n"
+#                                     "- The correct option may be marked by: a tick (✓), checkmark, circle, star (*), underline, bold, or written as 'Ans: b' or '1.(b)'.\n"
+#                                     "- Always clearly write which option letter is correct for each MCQ, e.g. 'Q1 correct answer: (b)'\n"
+#                                     "- List ALL options with their letters (a/b/c/d) but clearly mark which is correct.\n"
+#                                     "- Preserve question numbers (Q1, Q2, Q1a etc.) and all answer text word for word.\n"
+#                                     "Return only the extracted text."
+#                                 )},
+#                                 {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}}
+#                             ]
+#                         }]
+#                     })
+#                 r.raise_for_status()
+#                 return r.json()["choices"][0]["message"]["content"]
+#         except Exception as e:
+#             if attempt < 2:
+#                 await asyncio.sleep(10)
+#                 continue
+#             raise Exception(f"OCR (answer key) failed after 3 attempts: {str(e)}")
+
+
+##################### GEMINI OCR ###########################    
+
+############# GEMINI's OCR #################
 
 async def ocr(file_bytes, mime_type):
     import asyncio
-    b64 = to_b64(file_bytes)
-    
+    payload = {"contents":[{"parts":[
+        {"inline_data":{"mime_type":mime_type,"data":to_b64(file_bytes)}},
+        {"text":"Extract ALL text from this answer sheet exactly as written. Preserve question numbers (Q1, Q1a, Q1b, Q2 etc.), section headings, and full answers word for word. If unclear write [unclear]. Return only extracted text."}
+    ]}]}
+    for attempt in range(3):
+        async with httpx.AsyncClient(timeout=120) as c:
+            r = await c.post(GEMINI_URL, json=payload)
+            if r.status_code == 429:
+                wait = 15 * (attempt + 1)
+                print(f"Gemini 429 — waiting {wait}s before retry {attempt+1}/3")
+                await asyncio.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+    raise Exception("Gemini rate limit hit after 3 retries. Wait a minute and try again.")
+
+
+async def ocr_answer_key(file_bytes, mime_type):
+    import asyncio
+    payload = {"contents":[{"parts":[
+        {"inline_data":{"mime_type":mime_type,"data":to_b64(file_bytes)}},
+        {"text":(
+            "This is an ANSWER KEY document. Extract all text exactly as written.\n"
+            "CRITICAL for MCQ questions:\n"
+            "- The correct option may be marked by: a tick (✓), checkmark, circle, star (*), underline, bold, or written as 'Ans: b' or '1.(b)'.\n"
+            "- Always clearly write which option letter is correct for each MCQ, e.g. 'Q1 correct answer: (b)'\n"
+            "- List ALL options with their letters (a/b/c/d) but clearly mark which is correct.\n"
+            "- Preserve question numbers (Q1, Q2, Q1a etc.) and all answer text word for word.\n"
+            "Return only the extracted text."
+        )}
+    ]}]}
     for attempt in range(3):
         try:
             async with httpx.AsyncClient(timeout=120) as c:
-                r = await c.post(GROQ_URL,
-                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                    json={
-                        "model": OCR_MODEL,
-                        "max_tokens": 4000,
-                        "messages": [{
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": "Extract ALL text from this answer sheet exactly as written. Preserve question numbers (Q1, Q1a, Q1b, Q2 etc.), section headings, and full answers word for word. If unclear write [unclear]. Return only extracted text."},
-                                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}}
-                            ]
-                        }]
-                    })
+                r = await c.post(GEMINI_URL, json=payload)
+                if r.status_code == 429:
+                    wait = 15 * (attempt + 1)
+                    print(f"Gemini 429 — waiting {wait}s before retry {attempt+1}/3")
+                    await asyncio.sleep(wait)
+                    continue
                 r.raise_for_status()
-                return r.json()["choices"][0]["message"]["content"]
+                return r.json()["candidates"][0]["content"]["parts"][0]["text"]
         except Exception as e:
             if attempt < 2:
                 await asyncio.sleep(10)
                 continue
-            raise Exception(f"OCR failed after 3 attempts: {str(e)}")
+            raise Exception(f"OCR (answer key) failed after 3 attempts: {str(e)}")
+    raise Exception("OCR answer key failed after 3 retries.")
 
 def flatten(structure):
     units = []
@@ -196,19 +307,33 @@ async def grade(
         key_mime = answerKey.content_type
         if key_mime == "application/pdf":
             key_bytes, key_mime = pdf_to_image_bytes(key_bytes)
-        key_content = answerKeyText.strip() or await ocr(key_bytes, key_mime)
+        key_content = answerKeyText.strip() or await ocr_answer_key(key_bytes, key_mime)
 
         # Parse student answers
         ans_raw = await groq(
             "You are a JSON generator. You must ALWAYS respond with a valid JSON array only. No explanation, no markdown, no intro text.",
-            f"Extract student answers for these parts: {', '.join(labels)}\n\nANSWER SHEET TEXT:\n{extracted}\n\nRespond with ONLY this JSON array, nothing else:\n[{{\"label\":\"part_name\",\"answer\":\"student answer or empty string\"}}]\nInclude every part: {', '.join(labels)}")
+            f"Extract student answers for these parts: {', '.join(labels)}\n\nANSWER SHEET TEXT:\n{extracted}\n\n"
+            f"IMPORTANT RULES:\n"
+            f"- For MCQ questions where student circled/wrote an option letter (a/b/c/d), put ONLY the letter as the answer, e.g. \"b\"\n"
+            f"- For written answers, put the full answer text\n"
+            f"- If a question has no answer written, use empty string\n\n"
+            f"Respond with ONLY this JSON array, nothing else:\n"
+            f"[{{\"label\":\"part_name\",\"answer\":\"student answer or empty string\"}}]\n"
+            f"Include every part: {', '.join(labels)}")
         print(f"DEBUG ans_raw: {ans_raw[:300]}")
         answer_map = {i["label"]: i["answer"] for i in clean_json(ans_raw)}
 
         # Parse answer key
         key_raw = await groq(
             "You are a JSON generator. You must ALWAYS respond with a valid JSON array only. No explanation, no markdown, no intro text.",
-            f"Extract correct answers for these parts: {', '.join(labels)}\n\nANSWER KEY TEXT:\n{key_content}\n\nRespond with ONLY this JSON array, nothing else:\n[{{\"label\":\"part_name\",\"correct_answer\":\"correct answer\",\"key_concepts\":[\"concept1\",\"concept2\"]}}]\nInclude every part: {', '.join(labels)}")
+            f"Extract correct answers for these parts: {', '.join(labels)}\n\nANSWER KEY TEXT:\n{key_content}\n\n"
+            f"IMPORTANT RULES:\n"
+            f"- correct_answer: the full correct answer text. For MCQ, include the option letter prefix, e.g. '(b) Adiabatic process'\n"
+            f"- correct_option: ONLY for MCQ questions — put just the single option letter here (a/b/c/d/e). For non-MCQ put empty string.\n"
+            f"- key_concepts: list of key terms/concepts the answer must contain. For MCQ this can be empty.\n\n"
+            f"Respond with ONLY this JSON array, nothing else:\n"
+            f"[{{\"label\":\"part_name\",\"correct_answer\":\"(b) full answer\",\"correct_option\":\"b\",\"key_concepts\":[\"concept1\",\"concept2\"]}}]\n"
+            f"Include every part: {', '.join(labels)}")
         print(f"DEBUG key_raw: {key_raw[:300]}")
         key_map = {i["label"]: i for i in clean_json(key_raw)}
 
@@ -239,10 +364,14 @@ async def grade(
             # ── MCQ: exact letter match, skip similarity ───────────────────
             if is_mcq_answer(ans):
                 student_opt = extract_option(ans)
-                correct_opt = extract_option(ca)
-                is_correct  = student_opt == correct_opt
+                # Prefer the dedicated correct_option field extracted by LLM
+                # Fall back to parsing the option letter out of correct_answer text
+                correct_opt = ki.get("correct_option", "").strip().lower()[:1]
+                if not correct_opt or correct_opt not in "abcde12345":
+                    correct_opt = extract_option(ca)
+                is_correct    = student_opt == correct_opt
                 marks_awarded = mks if is_correct else 0
-                verdict = "Correct" if is_correct else "Incorrect"
+                verdict       = "Correct" if is_correct else "Incorrect"
                 graded.append({
                     "display_label":     lbl,
                     "parent":            u["parent"],
@@ -264,34 +393,50 @@ async def grade(
                 continue
 
             # ── Text answer: deterministic marks via hybrid similarity ─────
-            report      = keyword_report(ans, kc,
+            # ── Text answer: deterministic marks via hybrid similarity ─────
+            report      = concept_understanding_report(ans, ca, kc,
                               threshold_present=thresh["present"],
                               threshold_partial=thresh["partial"])
             ans_sim     = answer_level_sim(ans, ca)
             sim_context = format_sim_context(report, ans_sim)
 
-            # Marks locked — pure math, no LLM
-            marks_awarded = max(0, min(mks, round(report["partial_mark_multiplier"] * mks)))
+            # Marks — keyword presence + conceptual understanding
+            marks_awarded = max(0, min(mks, round(report["blended_multiplier"] * mks)))
 
-            # Confidence derived from average hybrid score across concepts
+            # Confidence — RAG grounding primary signal
             if report["per_keyword"]:
-                avg_hybrid = sum(r["hybrid"] for r in report["per_keyword"]) / len(report["per_keyword"])
+                avg_keyword = sum(r["hybrid"] for r in report["per_keyword"]) / len(report["per_keyword"])
+                rag_confidence = (ans_sim * 0.60) + (avg_keyword * 0.40)
             else:
-                avg_hybrid = ans_sim
-            confidence = round(min(95, max(40, avg_hybrid * 100)))
+                rag_confidence = ans_sim
+            confidence = round(min(95, max(40, rag_confidence * 100)))
 
             # ── LLM only writes feedback text — no mark decisions ──────────
             fb_raw = await groq(
-                f"You are a {subject} teacher. Return ONLY valid JSON.",
+                f"You are a {subject} teacher. Return ONLY valid JSON. Never use double quotes inside string values - use single quotes or rephrase instead.",
                 f"Write brief feedback for this graded answer.\n"
                 f"PART: {lbl}\nMARKS AWARDED: {marks_awarded}/{mks}\n"
                 f"STUDENT: {ans}\nCORRECT: {ca}\n\n"
                 f"{sim_context}\n\n"
+                f"UNDERSTANDING ANALYSIS:\n"
+                + "\n".join([
+                    f"- '{e['keyword']}': "
+                    f"{'jargon used ✓' if e['status'] == 'present' else 'jargon missing ✗'}, "
+                    f"understanding: {e.get('understanding', 'n/a')} "
+                    f"(score: {e.get('understanding_score', 0)})"
+                    for e in report["per_keyword"]
+                ]) +
+                f"\n\nFEEDBACK RULES:\n"
+                f"- keyword present → acknowledge correct terminology\n"
+                f"- keyword missing + understood → say 'you demonstrated understanding but use the term X'\n"
+                f"- keyword missing + not_understood → say 'review concept X'\n"
+                f"- keyword missing + partial → say 'you touched on X but need more precision'\n\n"
                 f"Return ONLY: {{\"feedback\":\"2 sentence constructive comment\","
                 f"\"confidence_reason\":\"one sentence explaining AI confidence level\","
-                f"\"needs_review\":{str(confidence < 55).lower()}}}",
+                f"\"needs_review\":{str(rag_confidence < 0.55).lower()}}}",
                 0.3)
             fb = clean_json(fb_raw)
+
 
             graded.append({
                 "display_label":     lbl,
@@ -307,7 +452,7 @@ async def grade(
                 "keywords_missing":  report["missing"],
                 "keywords_partial":  report["partial"],
                 "feedback":          fb.get("feedback", ""),
-                "needs_review":      fb.get("needs_review", confidence < 55),
+                "needs_review": rag_confidence < 0.55,
                 "answer_type":       "text",
                 "similarity_scores": {
                     "answer_sim": ans_sim,
