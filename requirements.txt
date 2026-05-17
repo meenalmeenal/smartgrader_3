@@ -4,5 +4,7 @@ python-multipart
 python-dotenv
 httpx
 Pillow
+PyMuPDF
 rapidfuzz
 sentence-transformers
+rank-bm25
