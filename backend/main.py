@@ -92,7 +92,7 @@ async def groq(system, user, temp=0.1):
         except Exception as e:
             if attempt < 2:
                 print(f"Groq attempt {attempt+1} failed: {e}. Retrying in 5s...")
-                await asyncio.sleep(5)
+                await asyncio.sleep(20)
                 continue
             raise Exception(f"Groq failed after 3 attempts: {str(e)}")
 
@@ -209,14 +209,17 @@ async def ocr(file_bytes, mime_type):
     import asyncio
     payload = {"contents":[{"parts":[
         {"inline_data":{"mime_type":mime_type,"data":to_b64(file_bytes)}},
-        {"text":"Extract ALL text from this answer sheet exactly as written. Preserve question numbers (Q1, Q1a, Q1b, Q2 etc.), section headings, and full answers word for word. If unclear write [unclear]. Return only extracted text."}
+        {"text": "Extract ALL text from this answer sheet exactly as written. "
+         "Preserve ALL question numbers, section headings, bullet points, arrows (→), and problem labels (Problem-1, Problem-2 etc.). "
+         "Include EVERY line — do not skip or summarize anything. "
+         "If unclear write [unclear]. Return only extracted text, nothing else."}
     ]}]}
     for attempt in range(3):
         try:
             async with httpx.AsyncClient(timeout=120) as c:
                 r = await c.post(GEMINI_URL, json=payload)
                 if r.status_code == 429:
-                    wait = 15 * (attempt + 1)
+                    wait = 30 * (attempt + 1)
                     print(f"Gemini 429 — waiting {wait}s before retry {attempt+1}/3")
                     await asyncio.sleep(wait)
                     continue
@@ -250,7 +253,7 @@ async def ocr_answer_key(file_bytes, mime_type):
             async with httpx.AsyncClient(timeout=120) as c:
                 r = await c.post(GEMINI_URL, json=payload)
                 if r.status_code == 429:
-                    wait = 15 * (attempt + 1)
+                    wait = 30 * (attempt + 1)
                     print(f"Gemini 429 — waiting {wait}s before retry {attempt+1}/3")
                     await asyncio.sleep(wait)
                     continue
@@ -316,21 +319,7 @@ async def grade(
             key_bytes, key_mime = pdf_to_image_bytes(key_bytes)
         key_content = answerKeyText.strip() or await ocr_answer_key(key_bytes, key_mime)
 
-        # Parse student answers
-        ans_raw = await groq(
-            "You are a JSON generator. You must ALWAYS respond with a valid JSON array only. No explanation, no markdown, no intro text.",
-            f"Extract student answers for these parts: {', '.join(labels)}\n\nANSWER SHEET TEXT:\n{extracted}\n\n"
-            f"IMPORTANT RULES:\n"
-            f"- For MCQ questions where student circled/wrote an option letter (a/b/c/d), put ONLY the letter as the answer, e.g. \"b\"\n"
-            f"- For written answers, put the full answer text\n"
-            f"- If a question has no answer written, use empty string\n\n"
-            f"Respond with ONLY this JSON array, nothing else:\n"
-            f"[{{\"label\":\"part_name\",\"answer\":\"student answer or empty string\"}}]\n"
-            f"Include every part: {', '.join(labels)}")
-        print(f"DEBUG ans_raw: {ans_raw[:300]}")
-        answer_map = {i["label"]: i["answer"] for i in clean_json(ans_raw)}
 
-        # Parse answer key
         key_raw = await groq(
             "You are a JSON generator. You must ALWAYS respond with a valid JSON array only. No explanation, no markdown, no intro text.",
             f"Extract correct answers for these parts: {', '.join(labels)}\n\nANSWER KEY TEXT:\n{key_content}\n\n"
@@ -343,7 +332,37 @@ async def grade(
             f"Include every part: {', '.join(labels)}")
         print(f"DEBUG key_raw: {key_raw[:300]}")
         key_map = {i["label"]: i for i in clean_json(key_raw)}
+        # Build question context
+        question_context = "\n".join([
+            f"- {lbl}: about '{key_map.get(lbl, {}).get('correct_answer', '')[:100]}'"
+            for lbl in labels
+        ])
+        
 
+        ans_raw = await groq(
+            "You are a JSON generator. You must ALWAYS respond with a valid JSON array only. No explanation, no markdown, no intro text.",
+            f"IMPORTANT: For questions that expect both benefits/concepts AND real-world examples/problems:\n"
+            f"- Collect ALL bullet points under any related heading (e.g. 'Why Blockchain?')\n"
+            f"- AND collect ALL 'Problem-X → Topic' lines on the page\n"
+            f"- Combine them ALL into that question's answer\n"
+            f"- The student may not have written Q2/Q3 labels for these — match by content\n"
+            f"Extract student answers for these question parts: {', '.join(labels)}\n\n"
+            f"ANSWER SHEET TEXT:\n{extracted}\n\n"
+            f"WHAT EACH QUESTION IS ABOUT (match by meaning not label):\n{question_context}\n\n"
+            f"CRITICAL RULES:\n"
+            f"1. Match by MEANING not by Q number — student may have used wrong labels\n"
+            f"2. Collect COMPLETE answer including all bullet points and examples\n"
+            f"3. If one question asks about multiple problems, combine ALL Problem-X entries\n"
+            f"4. NEVER truncate — include everything relevant\n"
+            f"5. For MCQ: if student wrote only a letter (a/b/c/d), put ONLY that letter\n"
+            f"6. If nothing found use empty string\n\n"
+            f"Respond ONLY: [{{\"label\":\"part_name\",\"answer\":\"complete student answer\"}}]\n"
+            f"Include every part: {', '.join(labels)}")
+        print(f"DEBUG ans_raw FULL: {ans_raw}")
+        answer_map = {i["label"]: i["answer"] for i in clean_json(ans_raw)}
+
+        # Parse answer key
+        
         # Strictness → similarity thresholds
         STRICT_THRESHOLDS = {
             "strict":   {"present": 0.80, "partial": 0.60},
@@ -419,45 +438,72 @@ async def grade(
                 rag_confidence = ans_sim
 
             # ── LLM grades + writes feedback ──────────────────────────────
+            _kw_understood   = [e['keyword'] for e in report['per_keyword'] if e.get('understanding') == 'understood' and e['status'] != 'present']
+            _kw_not_understood = [e['keyword'] for e in report['per_keyword'] if e.get('understanding') == 'not_understood']
+            _all_correct     = len(report['missing']) == 0 and len(_kw_not_understood) == 0
+            
             fb_raw = await groq(
-                f"You are a {subject} teacher. Return ONLY valid JSON. Never use double quotes inside string values - use single quotes or rephrase instead.",
-                f"Grade this answer and write feedback.\n"
-                f"PART: {lbl} | MAX MARKS: {mks}\n"
-                f"STUDENT: {ans[:300]}\n"
-                f"CORRECT: {ca[:300]}\n\n"
-                f"SIMILARITY ANALYSIS (already computed):\n"
-                f"- Overall answer similarity to model: {ans_sim}\n"
-                f"- Keywords present: {report['present']}\n"
-                f"- Keywords missing but understood: {[e['keyword'] for e in report['per_keyword'] if e.get('understanding')=='understood' and e['status']!='present']}\n"
-                f"- Keywords not understood: {[e['keyword'] for e in report['per_keyword'] if e.get('understanding')=='not_understood']}\n\n"
-                f"GRADING RULES:\n"
-                f"- Award marks for correct understanding even if exact jargon missing\n"
-                f"- Deduct marks only if concept is genuinely wrong or missing\n"
-                f"- suggested_marks must be integer between 0 and {mks}\n\n"
-                f"FEEDBACK RULES:\n"
-                f"- keyword missing + understood → say you demonstrated understanding but use the term X\n"
-                f"- keyword missing + not_understood → say review concept X\n\n"
-                f"Return ONLY: {{\"feedback\":\"2 sentence constructive comment\","
-                f"\"confidence_reason\":\"one sentence\","
+                f"You are a {subject} teacher marking a student exam. Return ONLY valid JSON. Never use double quotes inside string values.",
+                f"Verify this student answer and write feedback.\n"
+                f"QUESTION PART: {lbl} | MAX MARKS: {mks}\n"
+                f"STUDENT ANSWER: {ans[:300]}\n"
+                f"MODEL ANSWER: {ca[:300]}\n\n"
+                f"SIMILARITY ENGINE DETECTED:\n"
+                f"- Keywords found in student text: {report['present']}\n"
+                f"- Keywords understood but not stated: {_kw_understood}\n"
+                f"- Keywords not understood: {_kw_not_understood}\n\n"
+                f"YOUR JOB — two tasks:\n"
+                f"TASK 1 — Verify keyword usage: For each keyword in {report['present']}, check if the student used it CORRECTLY\n"
+                f"in the right conceptual context. A keyword present in text does NOT mean it was used correctly.\n"
+                f"Example: 'blockchain is not immutable' contains 'immutable' but uses it WRONGLY.\n"
+                f"If a keyword is misused, treat it as missing and reduce suggested_marks accordingly.\n\n"
+                f"TASK 2 — Write feedback following these rules STRICTLY:\n"
+                f"1. Focus ONLY on conceptual correctness — does the student understand the {subject} topic?\n"
+                f"2. NEVER mention spelling, grammar, punctuation, typos, or sentence structure.\n"
+                f"3. NEVER mention OCR artifacts, abbreviations, or handwriting.\n"
+                f"4. If all concepts correct AND all keywords used correctly → write 2 affirming sentences.\n"
+                f"5. If a keyword was misused → mention which concept needs correction.\n"
+                f"6. If keywords_understood_but_not_stated → say 'you showed understanding but use the term X'.\n"
+                f"7. suggested_marks must be an integer 0 to {mks}. Base it on conceptual correctness + correct keyword usage.\n\n"
+                f"Return ONLY: {{\"feedback\":\"2 sentence concept-focused comment\","
+                f"\"confidence_reason\":\"one sentence explaining AI confidence in this grade\","
                 f"\"suggested_marks\":0,"
                 f"\"needs_review\":{str(rag_confidence < 0.55).lower()}}}",
-                0.3)
+                0.1)  # Low temperature for consistency
 
             import re as _re2
-            fb_raw_fixed = _re2.sub(
-                r'("feedback"\s*:\s*")(.*?)("(?:\s*,|\s*}))',
-                lambda m: m.group(1) + m.group(2).replace('"', "'") + m.group(3),
-                fb_raw, flags=_re2.DOTALL)
-            fb_raw_fixed = _re2.sub(
-                r'("confidence_reason"\s*:\s*")(.*?)("(?:\s*,|\s*}))',
-                lambda m: m.group(1) + m.group(2).replace('"', "'") + m.group(3),
-                fb_raw_fixed, flags=_re2.DOTALL)
-            fb = clean_json(fb_raw_fixed)
+            def _fix_json_field(raw, field):
+                pattern = rf'("{field}"\s*:\s*")(.*?)("(?:\s*[,}}]))'
+                def replacer(m):
+                    inner = m.group(2).replace('\\"', '__ESCAPED__')
+                    inner = inner.replace('"', "'")
+                    inner = inner.replace('__ESCAPED__', '\\"')
+                    return m.group(1) + inner + m.group(3)
+                return _re2.sub(pattern, replacer, raw, flags=_re2.DOTALL)
 
-            # Blend similarity + LLM marks
+            fb_raw_fixed = _fix_json_field(fb_raw, "feedback")
+            fb_raw_fixed = _fix_json_field(fb_raw_fixed, "confidence_reason")
+            try:
+                fb = clean_json(fb_raw_fixed)
+            except:
+                # Last resort — extract just the fields manually
+                feedback_match = _re2.search(r'"feedback"\s*:\s*"(.*?)"(?:\s*[,}])', fb_raw_fixed, _re2.DOTALL)
+                reason_match   = _re2.search(r'"confidence_reason"\s*:\s*"(.*?)"(?:\s*[,}])', fb_raw_fixed, _re2.DOTALL)
+                marks_match    = _re2.search(r'"suggested_marks"\s*:\s*(\d+)', fb_raw_fixed)
+                review_match   = _re2.search(r'"needs_review"\s*:\s*(true|false)', fb_raw_fixed)
+                fb = {
+                    "feedback":          feedback_match.group(1) if feedback_match else "",
+                    "confidence_reason": reason_match.group(1)   if reason_match   else "",
+                    "suggested_marks":   int(marks_match.group(1)) if marks_match  else round(sim_marks),
+                    "needs_review":      review_match.group(1) == "true" if review_match else rag_confidence < 0.55
+                }
+
+            # Blend: sim is the stable anchor (70%), LLM is a context-aware correction (30%)
+            # LLM adjustment is clamped to ±1 mark to prevent wild swings
             llm_marks = float(fb.get("suggested_marks", sim_marks))
             llm_marks = max(0, min(mks, llm_marks))
-            marks_awarded = max(0, min(mks, round((sim_marks * 0.50) + (llm_marks * 0.50))))
+            llm_adjustment = max(-1, min(1, llm_marks - sim_marks))  # cap LLM correction to ±1
+            marks_awarded = max(0, min(mks, round(sim_marks + (llm_adjustment * 0.30))))
 
             # Confidence — agreement between sim and LLM boosts confidence
             sim_pct   = sim_marks / mks if mks else 0
